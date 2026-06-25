@@ -9,6 +9,7 @@ from radio_interferometer.gui import (
     apply_display_fringe_stop,
     apply_target_display_rounding,
     estimate_phase_rate_deg_s,
+    estimate_source_calibration,
     format_backend_stopped_message,
     format_ra_hours,
     format_fringe_model_status,
@@ -21,7 +22,7 @@ from radio_interferometer.gui import (
     resolve_automatic_target_coordinates,
     runtime_configs_match,
 )
-from radio_interferometer.sources import ObservationConfig
+from radio_interferometer.sources import ObservationConfig, sky_frequencies_hz
 
 
 def test_parse_ra_hours_accepts_hms_and_decimal_hours() -> None:
@@ -101,6 +102,88 @@ def test_display_fringe_stop_uses_east_conj_west_sign() -> None:
     stopped = apply_display_fringe_stop(raw_visibility, model)
 
     assert np.angle(stopped) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_source_calibration_estimates_total_instrument_terms() -> None:
+    bins = 256
+    sample_rate_hz = 2_000_000.0
+    model_delay_s = 8.5e-9
+    instrument_delay_s = 3.25e-9
+    instrument_phase_rad = np.radians(-42.0)
+    config = make_config(
+        bandwidth_mhz=sample_rate_hz / 1_000_000.0,
+        frequency_sideband="LO + IF",
+    )
+    offsets = np.fft.fftshift(np.fft.fftfreq(bins, d=1.0 / sample_rate_hz))
+    sky_freqs = sky_frequencies_hz(config, offsets)
+    sky_offsets = sky_freqs - config.observing_frequency_hz
+    raw_cross = np.exp(
+        -1j
+        * (
+            2.0 * np.pi * sky_freqs * model_delay_s
+            + 2.0 * np.pi * sky_offsets * instrument_delay_s
+            + instrument_phase_rad
+        )
+    )
+
+    estimate = estimate_source_calibration(
+        raw_cross,
+        offsets,
+        config,
+        model_delay_s,
+        edge_percent=0.0,
+    )
+
+    assert estimate.delay_ns == pytest.approx(instrument_delay_s * 1e9, abs=1e-9)
+    assert estimate.phase_deg == pytest.approx(-42.0, abs=1e-9)
+    assert estimate.fit_rms_deg < 1e-9
+    assert estimate.bins_used == bins
+
+
+def test_source_calibration_respects_low_sideband_delay_sign() -> None:
+    bins = 256
+    sample_rate_hz = 2_000_000.0
+    model_delay_s = 8.5e-9
+    instrument_delay_s = 3.25e-9
+    config = make_config(
+        bandwidth_mhz=sample_rate_hz / 1_000_000.0,
+        frequency_sideband="LO - IF",
+    )
+    offsets = np.fft.fftshift(np.fft.fftfreq(bins, d=1.0 / sample_rate_hz))
+    sky_freqs = sky_frequencies_hz(config, offsets)
+    sky_offsets = sky_freqs - config.observing_frequency_hz
+    raw_cross = np.exp(
+        -1j
+        * (
+            2.0 * np.pi * sky_freqs * model_delay_s
+            + 2.0 * np.pi * sky_offsets * instrument_delay_s
+        )
+    )
+
+    estimate = estimate_source_calibration(
+        raw_cross,
+        offsets,
+        config,
+        model_delay_s,
+        edge_percent=0.0,
+    )
+
+    assert estimate.delay_ns == pytest.approx(instrument_delay_s * 1e9, abs=1e-9)
+
+
+def test_source_calibration_rejects_too_few_clean_bins() -> None:
+    config = make_config()
+    offsets = np.array([-1.0, 0.0, 1.0])
+    raw_cross = np.ones(3, dtype=np.complex128)
+
+    with pytest.raises(ValueError, match="at least"):
+        estimate_source_calibration(
+            raw_cross,
+            offsets,
+            config,
+            model_delay_s=0.0,
+            edge_percent=0.0,
+        )
 
 
 def test_stopped_phase_rate_estimator_handles_unwrapped_ramp() -> None:

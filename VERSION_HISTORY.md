@@ -1,5 +1,18 @@
 # Version History
 
+## 0.6.0-mu - Source Calibration
+
+- Added a `Calibrate Source` GUI action for deriving instrumental delay and
+  phase from the current averaged cross spectrum while pointed at a strong
+  compact calibrator.
+- Fitted residual phase slope across clean frequency bins after geometric
+  fringe removal, respecting the configured RF sideband and East * conj(West)
+  visibility sign convention.
+- Wrote the derived total correction into the existing instrument delay and
+  phase fields, then reused the existing live backend update/reset path.
+- Added calibration estimator tests for phase sign, sideband delay sign, and
+  too-few-bin rejection.
+
 ## 0.5.3-iota - Native Crash Log
 
 - Enabled Python faulthandler in the backend process so native crashes such as

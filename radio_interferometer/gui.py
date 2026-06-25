@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 import csv
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -21,10 +21,17 @@ from matplotlib.widgets import Button, Slider, TextBox
 from . import __version__
 from .backend import BACKEND_CRASH_LOG_PATH, CorrelatorBackendProcess
 from .correlator import (
+    continuum_channel_mask,
     estimate_broadband_continuum_snr,
     estimate_peak_snr,
 )
-from .sources import ObservationConfig, fringe_model, sky_frequencies_hz, target_coordinates
+from .sources import (
+    ObservationConfig,
+    fringe_model,
+    fringe_stop_phasor,
+    sky_frequencies_hz,
+    target_coordinates,
+)
 
 GUI_REFRESH_MS = 80
 AVERAGING_DRAW_REFRESH_MS = 500
@@ -98,6 +105,9 @@ VISIBILITY_FIELD_DEFAULTS = [
     ("visibility_output_path", "Visibility CSV path", "visibilities.csv"),
     ("visibility_record_interval_s", "Visibility record interval (s)", "1.0"),
 ]
+
+CALIBRATION_MIN_BINS = 16
+CALIBRATION_WARN_RMS_DEG = 45.0
 
 VISIBILITY_CSV_FIELDS = [
     "timestamp_utc",
@@ -200,6 +210,7 @@ class InterferometryApp(tk.Tk):
         self._latest_raw_visibility: complex | None = None
         self._latest_stopped_visibility: complex | None = None
         self._latest_stopped_phase_rate_deg_s: float | None = None
+        self._latest_calibration_snapshot = None
         self._fringe_time_window_minutes = parse_fringe_window_minutes(
             self._settings["fringe_time_window_minutes"]
         )
@@ -409,6 +420,18 @@ class InterferometryApp(tk.Tk):
         button_row = visibility_row + len(VISIBILITY_FIELD_DEFAULTS)
         self.reset_button = ttk.Button(panel, text="Reset Avg", command=self.reset_average)
         self.reset_button.grid(row=button_row, column=0, columnspan=2, sticky="ew", pady=3)
+        self.calibrate_button = ttk.Button(
+            panel,
+            text="Calibrate Source",
+            command=self.calibrate_from_source,
+        )
+        self.calibrate_button.grid(
+            row=button_row + 1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=3,
+        )
 
         self.status = tk.StringVar(value=format_status_text("Ready"))
         ttk.Label(
@@ -800,12 +823,56 @@ class InterferometryApp(tk.Tk):
         self.start_button.configure(state=tk.NORMAL)
         self.stop_button.configure(state=tk.DISABLED)
         self._set_fringe_model_status(None, None, None)
+        self._latest_calibration_snapshot = None
 
     def reset_average(self) -> None:
         if self._backend is not None:
             self._backend.reset_average()
             self._reset_fringe_history()
             self._set_status("Averaging reset")
+
+    def calibrate_from_source(self) -> None:
+        if self._latest_calibration_snapshot is None:
+            self._set_status("Source calibration unavailable:", "No averaged visibility yet.")
+            return
+
+        config, raw_cross, frequency_offsets_hz, model_delay_s = self._latest_calibration_snapshot
+        try:
+            estimate = estimate_source_calibration(
+                raw_cross,
+                frequency_offsets_hz,
+                config,
+                model_delay_s,
+                edge_percent=parse_float_text(
+                    self._committed_continuum_inputs["continuum_edge_percent"],
+                    "Continuum edge exclude",
+                ),
+                rfi_sigma=parse_float_text(
+                    self._committed_continuum_inputs["continuum_rfi_sigma"],
+                    "Continuum RFI sigma",
+                ),
+            )
+        except ValueError as exc:
+            self._set_status("Source calibration failed:", str(exc))
+            return
+
+        self.inputs["instrumental_delay_ns"].set(f"{estimate.delay_ns:.3f}")
+        self.inputs["instrumental_phase_deg"].set(f"{estimate.phase_deg:.2f}")
+        commit_result = self._commit_text_fields()
+        if commit_result == "break":
+            return
+
+        warning = ""
+        if estimate.fit_rms_deg > CALIBRATION_WARN_RMS_DEG:
+            warning = f"Fit RMS high: {estimate.fit_rms_deg:.1f} deg"
+        else:
+            warning = f"Fit RMS {estimate.fit_rms_deg:.1f} deg"
+        self._set_status(
+            "Source calibration applied.",
+            f"Delay {estimate.delay_ns:+.3f} ns",
+            f"Phase {estimate.phase_deg:+.2f} deg",
+            f"Bins {estimate.bins_used}, {warning}",
+        )
 
     def _update_loop(self) -> None:
         if not self._running or self._backend is None:
@@ -855,6 +922,12 @@ class InterferometryApp(tk.Tk):
         peak_snr = estimate_peak_snr(interferogram_mag)
         peak_lag_bin = float(result.lag_bins[peak_snr.index])
         model = fringe_model(config)
+        self._latest_calibration_snapshot = (
+            config,
+            np.array(result.raw_cross_spectrum, dtype=np.complex128, copy=True),
+            np.array(result.frequency_offsets_hz, dtype=np.float64, copy=True),
+            model.delay_s,
+        )
         continuum, continuum_error = self._estimate_broadband_visibility(
             result,
             config,
@@ -1521,6 +1594,77 @@ def apply_display_fringe_stop(visibility: complex, model) -> complex:
     """Remove geometric phase from an East * conj(West) visibility."""
 
     return visibility * np.exp(1j * model.phase_rad)
+
+
+@dataclass(frozen=True)
+class SourceCalibrationEstimate:
+    delay_ns: float
+    phase_deg: float
+    fit_rms_deg: float
+    bins_used: int
+
+
+def estimate_source_calibration(
+    raw_cross_spectrum: np.ndarray,
+    frequency_offsets_hz: np.ndarray,
+    config: ObservationConfig,
+    model_delay_s: float,
+    *,
+    edge_percent: float,
+    rfi_sigma: float = 0.0,
+    min_bins: int = CALIBRATION_MIN_BINS,
+) -> SourceCalibrationEstimate:
+    """Estimate total instrumental delay and phase from a point-source calibrator."""
+
+    raw_cross = np.asarray(raw_cross_spectrum, dtype=np.complex128)
+    offsets = np.asarray(frequency_offsets_hz, dtype=np.float64)
+    if raw_cross.shape != offsets.shape or raw_cross.ndim != 1:
+        raise ValueError("Calibration spectrum and frequency offsets must be matching vectors.")
+
+    residual = raw_cross * fringe_stop_phasor(config, offsets, model_delay_s)
+    mask = continuum_channel_mask(residual, edge_percent=edge_percent, rfi_sigma=rfi_sigma)
+    mask &= np.isfinite(offsets) & np.isfinite(residual.real) & np.isfinite(residual.imag)
+    if np.count_nonzero(mask) < min_bins:
+        raise ValueError(f"Calibration needs at least {min_bins} clean frequency bins.")
+
+    sky_offsets_hz = sky_frequencies_hz(config, offsets) - config.observing_frequency_hz
+    x = sky_offsets_hz[mask]
+    y_complex = residual[mask]
+    order = np.argsort(x)
+    x = x[order]
+    y_complex = y_complex[order]
+
+    amplitudes = np.abs(y_complex)
+    valid = np.isfinite(amplitudes) & (amplitudes > 0.0)
+    if np.count_nonzero(valid) < min_bins:
+        raise ValueError("Calibration spectrum has too few non-zero clean bins.")
+    x = x[valid]
+    y_complex = y_complex[valid]
+    amplitudes = amplitudes[valid]
+
+    phase = np.unwrap(np.angle(y_complex))
+    design = np.column_stack((x, np.ones_like(x)))
+    weights = np.sqrt(amplitudes / np.nanmax(amplitudes))
+    weighted_design = design * weights[:, np.newaxis]
+    weighted_phase = phase * weights
+    slope_rad_per_hz, intercept_rad = np.linalg.lstsq(
+        weighted_design,
+        weighted_phase,
+        rcond=None,
+    )[0]
+
+    fit_phase = slope_rad_per_hz * x + intercept_rad
+    residual_phase_deg = np.degrees(np.unwrap(phase - fit_phase))
+    fit_rms_deg = float(np.sqrt(np.mean(np.square(residual_phase_deg))))
+
+    delay_ns = -slope_rad_per_hz / (2.0 * np.pi) * 1_000_000_000.0
+    phase_deg = wrap_degrees(-np.degrees(intercept_rad))
+    return SourceCalibrationEstimate(
+        delay_ns=float(delay_ns),
+        phase_deg=float(phase_deg),
+        fit_rms_deg=fit_rms_deg,
+        bins_used=int(x.size),
+    )
 
 
 def estimate_phase_rate_deg_s(times_s: np.ndarray, phase_rad: np.ndarray) -> float | None:

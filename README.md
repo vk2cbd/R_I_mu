@@ -83,6 +83,9 @@ baseline for future changes and should be pushed to `vk2cbd/test` on GitHub.
   RFI-outlier rejection before coherent frequency-bin summing.
 - Realtime broadband visibility readout and optional CSV recording with a
   user-selected output path and recording interval.
+- Source-based calibration button that estimates instrumental delay and phase
+  from a strong compact calibrator and applies the values to the existing
+  instrument correction fields.
 - Continuous B210 streaming with a background reader thread and bounded queue,
   so plotting and FFT work do not directly interrupt SDR reads.
 - Configurable B210 stream chunk samples so hardware `readStream()` transfers
