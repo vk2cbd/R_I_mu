@@ -940,14 +940,23 @@ class InterferometryApp(tk.Tk):
             self._set_status("Averaging reset")
 
     def start_calibration_run(self) -> None:
+        try:
+            self._start_calibration_run()
+        except Exception as exc:
+            self._fail_calibration_run_start(str(exc))
+
+    def _start_calibration_run(self) -> None:
         if not self._running or self._backend is None:
-            self._set_status("Calibration run not started:", "Start the backend first.")
+            self._fail_calibration_run_start("Start the backend first.")
             return
         if self._calibration_run_active:
             self._set_status("Calibration run already active.")
             return
 
-        if self._commit_text_fields() == "break":
+        self._set_status("Starting calibration run...")
+        self.update_idletasks()
+        if self._commit_text_fields() is False:
+            self._fail_calibration_run_start("Text fields did not validate.")
             return
         try:
             validate_calibration_run_inputs(self._committed_calibration_inputs)
@@ -963,20 +972,22 @@ class InterferometryApp(tk.Tk):
                 self._committed_calibration_inputs["calibration_output_path"].strip()
             )
         except ValueError as exc:
-            self._set_status("Calibration run not started:", str(exc))
+            self._fail_calibration_run_start(str(exc))
             return
 
         source_mode = self.calibration_source_mode.get()
         if source_mode not in TARGET_SOURCE_OPTIONS:
-            self._set_status("Calibration run not started:", "Calibration source is invalid.")
+            self._fail_calibration_run_start("Calibration source is invalid.")
             return
 
         if self.target_mode.get() != source_mode:
             self.target_mode.set(source_mode)
             self._refresh_target_coordinate_fields(force=True)
-            if self._commit_text_fields() == "break":
+            if self._commit_text_fields() is False:
+                self._fail_calibration_run_start("Calibration source did not validate.")
                 return
             if self._running and not self._apply_runtime_config_if_needed():
+                self._fail_calibration_run_start("Calibration source was not applied.")
                 return
 
         now = monotonic()
@@ -990,12 +1001,21 @@ class InterferometryApp(tk.Tk):
         self._calibration_run_rows = []
         self.start_calibration_run_button.configure(state=tk.DISABLED)
         self.stop_calibration_run_button.configure(state=tk.NORMAL)
+        self.update_idletasks()
         self._set_status(
             "Calibration run started.",
             f"Source {source_mode}",
             f"Duration {duration_min:.1f} min",
             f"Interval {interval_s:.1f} s",
         )
+
+    def _fail_calibration_run_start(self, message: str) -> None:
+        self._calibration_run_active = False
+        if hasattr(self, "start_calibration_run_button"):
+            self.start_calibration_run_button.configure(state=tk.NORMAL)
+            self.stop_calibration_run_button.configure(state=tk.DISABLED)
+        self._set_status("Calibration run not started:", message)
+        messagebox.showwarning("Calibration run not started", message)
 
     def stop_calibration_run(self, finished: bool = False) -> None:
         if not self._calibration_run_active:
@@ -1046,7 +1066,7 @@ class InterferometryApp(tk.Tk):
         self.inputs["instrumental_delay_ns"].set(f"{estimate.delay_ns:.3f}")
         self.inputs["instrumental_phase_deg"].set(f"{estimate.phase_deg:.2f}")
         commit_result = self._commit_text_fields()
-        if commit_result == "break":
+        if commit_result is False:
             return
 
         warning = ""
@@ -1672,7 +1692,7 @@ class InterferometryApp(tk.Tk):
         if self._running:
             self._apply_runtime_config_if_needed()
 
-    def _commit_text_fields(self, _event=None) -> str:
+    def _commit_text_fields(self, _event=None):
         new_inputs = {key: value.get() for key, value in self.inputs.items()}
         new_inputs = self._target_adjusted_inputs(new_inputs)
         new_continuum_inputs = {key: value.get() for key, value in self.continuum_inputs.items()}
@@ -1688,7 +1708,7 @@ class InterferometryApp(tk.Tk):
             validate_calibration_run_inputs(new_calibration_inputs)
         except Exception as exc:
             self._set_status("Text fields not committed:", str(exc))
-            return "break"
+            return "break" if _event is not None else False
 
         self._update_calculated_observing_frequency(new_inputs)
         for key in (
@@ -1715,7 +1735,7 @@ class InterferometryApp(tk.Tk):
             self._apply_runtime_config_if_needed()
         else:
             self._set_status("Text fields committed")
-        return "break"
+        return "break" if _event is not None else True
 
     def _update_calculated_observing_frequency(self, inputs: dict[str, str]) -> None:
         lnb_lo_mhz = parse_float_text(inputs["lnb_lo_frequency_mhz"], "LNB LO frequency")

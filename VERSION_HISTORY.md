@@ -1,5 +1,13 @@
 # Version History
 
+## 0.6.2-mu - Calibration Run Start Fix
+
+- Fixed the `Start Cal Run` button treating successful text-field commits as
+  failures, which prevented the run from starting and left `Stop Cal Run`
+  disabled.
+- Added explicit calibration-start warnings so future start failures show the
+  reason instead of being hidden by the live runtime status refresh.
+
 ## 0.6.1-mu - Timed Source Calibration Runs
 
 - Added configurable source-calibration runs with source, duration, interval,
