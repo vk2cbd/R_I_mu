@@ -6,6 +6,8 @@ import pytest
 
 from radio_interferometer.gui import (
     BACKEND_CRASH_LOG_PATH,
+    CALIBRATION_CSV_FIELDS,
+    append_csv_row,
     apply_display_fringe_stop,
     apply_target_display_rounding,
     estimate_phase_rate_deg_s,
@@ -21,6 +23,7 @@ from radio_interferometer.gui import (
     parse_ra_hours_text,
     resolve_automatic_target_coordinates,
     runtime_configs_match,
+    validate_calibration_run_inputs,
 )
 from radio_interferometer.sources import ObservationConfig, sky_frequencies_hz
 
@@ -184,6 +187,39 @@ def test_source_calibration_rejects_too_few_clean_bins() -> None:
             model_delay_s=0.0,
             edge_percent=0.0,
         )
+
+
+def test_validate_calibration_run_inputs_requires_positive_values() -> None:
+    validate_calibration_run_inputs(
+        {
+            "calibration_duration_min": "30",
+            "calibration_interval_s": "20",
+            "calibration_output_path": "source_calibration.csv",
+        }
+    )
+
+    with pytest.raises(ValueError, match="duration"):
+        validate_calibration_run_inputs(
+            {
+                "calibration_duration_min": "0",
+                "calibration_interval_s": "20",
+                "calibration_output_path": "source_calibration.csv",
+            }
+        )
+
+
+def test_append_csv_row_writes_header_and_row(tmp_path) -> None:
+    path = tmp_path / "logs" / "calibration.csv"
+    row = {field: "" for field in CALIBRATION_CSV_FIELDS}
+    row["timestamp_utc"] = "2026-06-26T00:00:00+00:00"
+    row["estimated_delay_ns"] = 1.25
+    row["estimated_phase_deg"] = -42.0
+
+    append_csv_row(path, CALIBRATION_CSV_FIELDS, row)
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0].startswith("timestamp_utc,elapsed_s,calibration_source")
+    assert "2026-06-26T00:00:00+00:00" in lines[1]
 
 
 def test_stopped_phase_rate_estimator_handles_unwrapped_ramp() -> None:

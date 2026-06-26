@@ -86,6 +86,9 @@ baseline for future changes and should be pushed to `vk2cbd/test` on GitHub.
 - Source-based calibration button that estimates instrumental delay and phase
   from a strong compact calibrator and applies the values to the existing
   instrument correction fields.
+- Timed source-calibration runs with configurable source, duration, interval,
+  and CSV log path. At completion the GUI opens a graticuled plot of estimated
+  delay, phase, and fit RMS over time.
 - Continuous B210 streaming with a background reader thread and bounded queue,
   so plotting and FFT work do not directly interrupt SDR reads.
 - Configurable B210 stream chunk samples so hardware `readStream()` transfers

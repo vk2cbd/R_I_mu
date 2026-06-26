@@ -106,6 +106,12 @@ VISIBILITY_FIELD_DEFAULTS = [
     ("visibility_record_interval_s", "Visibility record interval (s)", "1.0"),
 ]
 
+CALIBRATION_RUN_FIELD_DEFAULTS = [
+    ("calibration_duration_min", "Cal duration (min)", "30.0"),
+    ("calibration_interval_s", "Cal interval (s)", "20.0"),
+    ("calibration_output_path", "Cal CSV path", "source_calibration.csv"),
+]
+
 CALIBRATION_MIN_BINS = 16
 CALIBRATION_WARN_RMS_DEG = 45.0
 
@@ -138,6 +144,32 @@ VISIBILITY_CSV_FIELDS = [
     "edge_bins_excluded",
 ]
 
+CALIBRATION_CSV_FIELDS = [
+    "timestamp_utc",
+    "elapsed_s",
+    "calibration_source",
+    "observing_frequency_mhz",
+    "intermediate_frequency_mhz",
+    "bandwidth_mhz",
+    "bins",
+    "averaging_blocks",
+    "baseline_east_m",
+    "baseline_north_m",
+    "baseline_up_m",
+    "source_ra_deg",
+    "source_dec_deg",
+    "observer_lat_deg",
+    "observer_lon_deg",
+    "fringe_stop_mode",
+    "frequency_sideband",
+    "current_instrumental_delay_ns",
+    "current_instrumental_phase_deg",
+    "estimated_delay_ns",
+    "estimated_phase_deg",
+    "fit_rms_deg",
+    "clean_bins",
+]
+
 DEFAULT_SETTINGS = {
     "source_mode": "Simulator",
     "target_mode": MANUAL_TARGET_SOURCE,
@@ -155,10 +187,12 @@ DEFAULT_SETTINGS = {
     "fringe_time_window_minutes": f"{FRINGE_WINDOW_MINUTES_DEFAULT:.0f}",
     "continuum_snr_mode": "on",
     "record_visibility_mode": "off",
+    "calibration_source_mode": "Sun",
     **{key: default for key, _, default in FIELD_DEFAULTS},
     **{key: default for key, _, default in PLOT_SCALE_DEFAULTS},
     **{key: default for key, _, default in CONTINUUM_FIELD_DEFAULTS},
     **{key: default for key, _, default in VISIBILITY_FIELD_DEFAULTS},
+    **{key: default for key, _, default in CALIBRATION_RUN_FIELD_DEFAULTS},
 }
 
 
@@ -188,6 +222,10 @@ class InterferometryApp(tk.Tk):
         self._committed_visibility_inputs = {
             key: self._settings.get(key, default) for key, _, default in VISIBILITY_FIELD_DEFAULTS
         }
+        self._committed_calibration_inputs = {
+            key: self._settings.get(key, default)
+            for key, _, default in CALIBRATION_RUN_FIELD_DEFAULTS
+        }
         self._plot_scale_inputs = {
             key: self._settings.get(key, default) for key, _, default in PLOT_SCALE_DEFAULTS
         }
@@ -211,6 +249,14 @@ class InterferometryApp(tk.Tk):
         self._latest_stopped_visibility: complex | None = None
         self._latest_stopped_phase_rate_deg_s: float | None = None
         self._latest_calibration_snapshot = None
+        self._calibration_run_active = False
+        self._calibration_run_start_monotonic = 0.0
+        self._calibration_run_end_monotonic = 0.0
+        self._calibration_run_next_sample_monotonic = 0.0
+        self._calibration_run_interval_s = 0.0
+        self._calibration_run_source = self._settings.get("calibration_source_mode", "Sun")
+        self._calibration_run_path = Path("source_calibration.csv")
+        self._calibration_run_rows: list[dict[str, object]] = []
         self._fringe_time_window_minutes = parse_fringe_window_minutes(
             self._settings["fringe_time_window_minutes"]
         )
@@ -417,7 +463,32 @@ class InterferometryApp(tk.Tk):
             entry.grid(row=row, column=1, sticky="ew", pady=3)
             self._bind_commit_entry(entry)
 
-        button_row = visibility_row + len(VISIBILITY_FIELD_DEFAULTS)
+        calibration_row = visibility_row + len(VISIBILITY_FIELD_DEFAULTS)
+        self.calibration_source_mode = tk.StringVar(
+            value=self._settings.get("calibration_source_mode", "Sun")
+        )
+        ttk.Label(panel, text="Cal source").grid(row=calibration_row, column=0, sticky="w", pady=3)
+        ttk.Combobox(
+            panel,
+            textvariable=self.calibration_source_mode,
+            values=TARGET_SOURCE_OPTIONS,
+            state="readonly",
+            width=18,
+        ).grid(row=calibration_row, column=1, sticky="ew", pady=3)
+
+        self.calibration_inputs: dict[str, tk.StringVar] = {}
+        for row, (key, label, default) in enumerate(
+            CALIBRATION_RUN_FIELD_DEFAULTS,
+            start=calibration_row + 1,
+        ):
+            ttk.Label(panel, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            value = tk.StringVar(value=self._settings.get(key, default))
+            self.calibration_inputs[key] = value
+            entry = ttk.Entry(panel, textvariable=value, width=18)
+            entry.grid(row=row, column=1, sticky="ew", pady=3)
+            self._bind_commit_entry(entry)
+
+        button_row = calibration_row + 1 + len(CALIBRATION_RUN_FIELD_DEFAULTS)
         self.reset_button = ttk.Button(panel, text="Reset Avg", command=self.reset_average)
         self.reset_button.grid(row=button_row, column=0, columnspan=2, sticky="ew", pady=3)
         self.calibrate_button = ttk.Button(
@@ -429,6 +500,29 @@ class InterferometryApp(tk.Tk):
             row=button_row + 1,
             column=0,
             columnspan=2,
+            sticky="ew",
+            pady=3,
+        )
+        self.start_calibration_run_button = ttk.Button(
+            panel,
+            text="Start Cal Run",
+            command=self.start_calibration_run,
+        )
+        self.start_calibration_run_button.grid(
+            row=button_row + 2,
+            column=0,
+            sticky="ew",
+            pady=3,
+        )
+        self.stop_calibration_run_button = ttk.Button(
+            panel,
+            text="Stop Cal Run",
+            command=self.stop_calibration_run,
+            state=tk.DISABLED,
+        )
+        self.stop_calibration_run_button.grid(
+            row=button_row + 2,
+            column=1,
             sticky="ew",
             pady=3,
         )
@@ -476,6 +570,7 @@ class InterferometryApp(tk.Tk):
         self._watch_control(self.fringe_iq_autoscale)
         self._watch_control(self.continuum_snr_mode)
         self._watch_control(self.record_visibility_mode)
+        self._watch_control(self.calibration_source_mode)
         self._refresh_target_coordinate_fields(force=True)
 
     def _bind_commit_entry(self, entry: ttk.Entry) -> None:
@@ -486,6 +581,17 @@ class InterferometryApp(tk.Tk):
         self.status.set(format_status_text(*lines))
 
     def _set_runtime_status(self) -> None:
+        if self._calibration_run_active:
+            remaining_s = max(0.0, self._calibration_run_end_monotonic - monotonic())
+            self.status.set(
+                format_status_text(
+                    f"Running backend. Calibration {self._calibration_run_source}.",
+                    self._format_averaging_status(),
+                    f"Samples {len(self._calibration_run_rows)}, remain {remaining_s / 60.0:.1f} min",
+                    f"Log {self._calibration_run_path}",
+                )
+            )
+            return
         self.status.set(
             format_runtime_status_text(
                 self._format_averaging_status(),
@@ -811,6 +917,8 @@ class InterferometryApp(tk.Tk):
         self.after(20, self._update_loop)
 
     def stop(self) -> None:
+        if self._calibration_run_active:
+            self.stop_calibration_run(finished=False)
         self._running = False
         if self._backend is not None:
             try:
@@ -830,6 +938,85 @@ class InterferometryApp(tk.Tk):
             self._backend.reset_average()
             self._reset_fringe_history()
             self._set_status("Averaging reset")
+
+    def start_calibration_run(self) -> None:
+        if not self._running or self._backend is None:
+            self._set_status("Calibration run not started:", "Start the backend first.")
+            return
+        if self._calibration_run_active:
+            self._set_status("Calibration run already active.")
+            return
+
+        if self._commit_text_fields() == "break":
+            return
+        try:
+            validate_calibration_run_inputs(self._committed_calibration_inputs)
+            duration_min = parse_float_text(
+                self._committed_calibration_inputs["calibration_duration_min"],
+                "Calibration duration",
+            )
+            interval_s = parse_float_text(
+                self._committed_calibration_inputs["calibration_interval_s"],
+                "Calibration interval",
+            )
+            output_path = Path(
+                self._committed_calibration_inputs["calibration_output_path"].strip()
+            )
+        except ValueError as exc:
+            self._set_status("Calibration run not started:", str(exc))
+            return
+
+        source_mode = self.calibration_source_mode.get()
+        if source_mode not in TARGET_SOURCE_OPTIONS:
+            self._set_status("Calibration run not started:", "Calibration source is invalid.")
+            return
+
+        if self.target_mode.get() != source_mode:
+            self.target_mode.set(source_mode)
+            self._refresh_target_coordinate_fields(force=True)
+            if self._commit_text_fields() == "break":
+                return
+            if self._running and not self._apply_runtime_config_if_needed():
+                return
+
+        now = monotonic()
+        self._calibration_run_active = True
+        self._calibration_run_start_monotonic = now
+        self._calibration_run_end_monotonic = now + duration_min * 60.0
+        self._calibration_run_next_sample_monotonic = now + interval_s
+        self._calibration_run_interval_s = interval_s
+        self._calibration_run_source = source_mode
+        self._calibration_run_path = output_path
+        self._calibration_run_rows = []
+        self.start_calibration_run_button.configure(state=tk.DISABLED)
+        self.stop_calibration_run_button.configure(state=tk.NORMAL)
+        self._set_status(
+            "Calibration run started.",
+            f"Source {source_mode}",
+            f"Duration {duration_min:.1f} min",
+            f"Interval {interval_s:.1f} s",
+        )
+
+    def stop_calibration_run(self, finished: bool = False) -> None:
+        if not self._calibration_run_active:
+            return
+        self._calibration_run_active = False
+        if hasattr(self, "start_calibration_run_button"):
+            self.start_calibration_run_button.configure(state=tk.NORMAL)
+            self.stop_calibration_run_button.configure(state=tk.DISABLED)
+        if finished:
+            self._set_status(
+                "Calibration run complete.",
+                f"Samples {len(self._calibration_run_rows)}",
+                f"Log {self._calibration_run_path}",
+            )
+            self._show_calibration_run_plot()
+        else:
+            self._set_status(
+                "Calibration run stopped.",
+                f"Samples {len(self._calibration_run_rows)}",
+                f"Log {self._calibration_run_path}",
+            )
 
     def calibrate_from_source(self) -> None:
         if self._latest_calibration_snapshot is None:
@@ -900,12 +1087,138 @@ class InterferometryApp(tk.Tk):
                 )
 
             self._set_runtime_status()
+            self._update_calibration_run()
         except Exception as exc:
             self.stop()
             messagebox.showerror("Runtime error", str(exc))
             return
 
         self.after(GUI_REFRESH_MS, self._update_loop)
+
+    def _update_calibration_run(self) -> None:
+        if not self._calibration_run_active:
+            return
+        now = monotonic()
+        if now >= self._calibration_run_next_sample_monotonic:
+            self._record_calibration_run_sample(now)
+            self._calibration_run_next_sample_monotonic = now + self._calibration_run_interval_s
+        if now >= self._calibration_run_end_monotonic:
+            self.stop_calibration_run(finished=True)
+
+    def _record_calibration_run_sample(self, now: float) -> None:
+        if self._latest_calibration_snapshot is None:
+            self._set_status("Calibration sample skipped:", "No averaged visibility yet.")
+            return
+
+        config, raw_cross, frequency_offsets_hz, model_delay_s = self._latest_calibration_snapshot
+        try:
+            estimate = estimate_source_calibration(
+                raw_cross,
+                frequency_offsets_hz,
+                config,
+                model_delay_s,
+                edge_percent=parse_float_text(
+                    self._committed_continuum_inputs["continuum_edge_percent"],
+                    "Continuum edge exclude",
+                ),
+                rfi_sigma=parse_float_text(
+                    self._committed_continuum_inputs["continuum_rfi_sigma"],
+                    "Continuum RFI sigma",
+                ),
+            )
+        except ValueError as exc:
+            self._set_status("Calibration sample skipped:", str(exc))
+            return
+
+        elapsed_s = now - self._calibration_run_start_monotonic
+        row = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "elapsed_s": elapsed_s,
+            "calibration_source": self._calibration_run_source,
+            "observing_frequency_mhz": config.observing_frequency_mhz,
+            "intermediate_frequency_mhz": config.intermediate_frequency_mhz,
+            "bandwidth_mhz": config.bandwidth_mhz,
+            "bins": config.bins,
+            "averaging_blocks": config.averaging_blocks,
+            "baseline_east_m": config.baseline_east_m,
+            "baseline_north_m": config.baseline_north_m,
+            "baseline_up_m": config.baseline_up_m,
+            "source_ra_deg": config.ra_deg,
+            "source_dec_deg": config.dec_deg,
+            "observer_lat_deg": config.observer_lat_deg,
+            "observer_lon_deg": config.observer_lon_deg,
+            "fringe_stop_mode": config.fringe_stop_mode,
+            "frequency_sideband": config.frequency_sideband,
+            "current_instrumental_delay_ns": config.instrumental_delay_ns,
+            "current_instrumental_phase_deg": config.instrumental_phase_deg,
+            "estimated_delay_ns": estimate.delay_ns,
+            "estimated_phase_deg": estimate.phase_deg,
+            "fit_rms_deg": estimate.fit_rms_deg,
+            "clean_bins": estimate.bins_used,
+        }
+        try:
+            append_csv_row(self._calibration_run_path, CALIBRATION_CSV_FIELDS, row)
+        except OSError as exc:
+            self.stop_calibration_run(finished=False)
+            self._set_status("Calibration logging stopped:", str(exc))
+            return
+
+        self._calibration_run_rows.append(row)
+        remaining_s = max(0.0, self._calibration_run_end_monotonic - now)
+        self._set_status(
+            "Calibration sample logged.",
+            f"Delay {estimate.delay_ns:+.3f} ns",
+            f"Phase {estimate.phase_deg:+.2f} deg",
+            f"Remaining {remaining_s / 60.0:.1f} min",
+        )
+
+    def _show_calibration_run_plot(self) -> None:
+        if not self._calibration_run_rows:
+            messagebox.showinfo("Calibration run", "No calibration samples were recorded.")
+            return
+
+        elapsed_min = np.asarray(
+            [float(row["elapsed_s"]) / 60.0 for row in self._calibration_run_rows],
+            dtype=np.float64,
+        )
+        delays = np.asarray(
+            [float(row["estimated_delay_ns"]) for row in self._calibration_run_rows],
+            dtype=np.float64,
+        )
+        phases = np.asarray(
+            [float(row["estimated_phase_deg"]) for row in self._calibration_run_rows],
+            dtype=np.float64,
+        )
+        fit_rms = np.asarray(
+            [float(row["fit_rms_deg"]) for row in self._calibration_run_rows],
+            dtype=np.float64,
+        )
+
+        plot_window = tk.Toplevel(self)
+        plot_window.title("Source Calibration Run")
+        figure = Figure(figsize=(9.5, 7.0), dpi=100)
+        delay_axis = figure.add_subplot(3, 1, 1)
+        phase_axis = figure.add_subplot(3, 1, 2, sharex=delay_axis)
+        rms_axis = figure.add_subplot(3, 1, 3, sharex=delay_axis)
+        delay_axis.plot(elapsed_min, delays, marker="o", lw=1.2, color="#1f77b4")
+        phase_axis.plot(elapsed_min, phases, marker="o", lw=1.2, color="#d62728")
+        rms_axis.plot(elapsed_min, fit_rms, marker="o", lw=1.2, color="#2ca02c")
+        delay_axis.set_title(f"Source Calibration: {self._calibration_run_source}")
+        delay_axis.set_ylabel("Delay (ns)")
+        phase_axis.set_ylabel("Phase (deg)")
+        rms_axis.set_ylabel("Fit RMS (deg)")
+        rms_axis.set_xlabel("Elapsed time (min)")
+        for axis in (delay_axis, phase_axis, rms_axis):
+            axis.set_axisbelow(True)
+            axis.xaxis.set_minor_locator(AutoMinorLocator(2))
+            axis.yaxis.set_minor_locator(AutoMinorLocator(2))
+            axis.grid(True, which="major", color=GRID_MAJOR_COLOR, linewidth=0.75, alpha=0.9)
+            axis.grid(True, which="minor", color=GRID_MINOR_COLOR, linewidth=0.5, alpha=0.8)
+        figure.tight_layout()
+        canvas = FigureCanvasTkAgg(figure, master=plot_window)
+        canvas.draw()
+        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(canvas, plot_window)
 
     def _draw_result(self, result) -> None:
         config = self._latest_config
@@ -1364,11 +1677,15 @@ class InterferometryApp(tk.Tk):
         new_inputs = self._target_adjusted_inputs(new_inputs)
         new_continuum_inputs = {key: value.get() for key, value in self.continuum_inputs.items()}
         new_visibility_inputs = {key: value.get() for key, value in self.visibility_inputs.items()}
+        new_calibration_inputs = {
+            key: value.get() for key, value in self.calibration_inputs.items()
+        }
 
         try:
             self._read_config(new_inputs)
             validate_continuum_inputs(new_continuum_inputs)
             validate_visibility_inputs(new_visibility_inputs)
+            validate_calibration_run_inputs(new_calibration_inputs)
         except Exception as exc:
             self._set_status("Text fields not committed:", str(exc))
             return "break"
@@ -1390,6 +1707,7 @@ class InterferometryApp(tk.Tk):
         self._committed_inputs = new_inputs
         self._committed_continuum_inputs = new_continuum_inputs
         self._committed_visibility_inputs = new_visibility_inputs
+        self._committed_calibration_inputs = new_calibration_inputs
         self._save_settings()
         self._apply_panel_plot_scales(draw=True)
 
@@ -1536,6 +1854,7 @@ class InterferometryApp(tk.Tk):
         settings = {
             "source_mode": self.source_mode.get(),
             "target_mode": self.target_mode.get(),
+            "calibration_source_mode": self.calibration_source_mode.get(),
             "fringe_stop_mode": self.fringe_stop_mode.get(),
             "frequency_sideband": self.frequency_sideband.get(),
             "spectrum_plot_mode": self.spectrum_plot_mode.get(),
@@ -1554,6 +1873,7 @@ class InterferometryApp(tk.Tk):
         settings.update(self._committed_inputs)
         settings.update(self._committed_continuum_inputs)
         settings.update(self._committed_visibility_inputs)
+        settings.update(self._committed_calibration_inputs)
         settings.update(self._plot_scale_inputs)
         try:
             SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
@@ -2035,9 +2355,31 @@ def validate_visibility_inputs(values: dict[str, str]) -> None:
         raise ValueError("Visibility record interval must be 0 or greater.")
 
 
+def validate_calibration_run_inputs(values: dict[str, str]) -> None:
+    duration_min = parse_float_text(values["calibration_duration_min"], "Calibration duration")
+    interval_s = parse_float_text(values["calibration_interval_s"], "Calibration interval")
+    output_path = values["calibration_output_path"].strip()
+    if duration_min <= 0:
+        raise ValueError("Calibration duration must be greater than 0 minutes.")
+    if interval_s <= 0:
+        raise ValueError("Calibration interval must be greater than 0 seconds.")
+    if not output_path:
+        raise ValueError("Calibration CSV path must not be empty.")
+
+
 def validate_scale_limits(y_min: float, y_max: float) -> None:
     if y_min >= y_max:
         raise ValueError("Manual scale minimum must be less than maximum.")
+
+
+def append_csv_row(path: Path, fieldnames: list[str], row: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def load_settings() -> dict[str, str]:
@@ -2061,6 +2403,8 @@ def load_settings() -> dict[str, str]:
         settings["source_mode"] = DEFAULT_SETTINGS["source_mode"]
     if settings["target_mode"] not in TARGET_SOURCE_OPTIONS:
         settings["target_mode"] = DEFAULT_SETTINGS["target_mode"]
+    if settings["calibration_source_mode"] not in TARGET_SOURCE_OPTIONS:
+        settings["calibration_source_mode"] = DEFAULT_SETTINGS["calibration_source_mode"]
     if settings["fringe_stop_mode"] not in FRINGE_STOP_OPTIONS:
         settings["fringe_stop_mode"] = DEFAULT_SETTINGS["fringe_stop_mode"]
     if settings["frequency_sideband"] not in FREQUENCY_SIDEBAND_OPTIONS:

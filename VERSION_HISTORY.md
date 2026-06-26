@@ -1,5 +1,15 @@
 # Version History
 
+## 0.6.1-mu - Timed Source Calibration Runs
+
+- Added configurable source-calibration runs with source, duration, interval,
+  and CSV output path controls.
+- Logged timestamped instrumental delay and phase estimates at each interval
+  without continuously applying them to the live correction fields.
+- Added an end-of-run plot window showing delay, phase, and phase-fit RMS
+  versus elapsed time with labelled axes and major/minor graticules.
+- Added tests for calibration run input validation and CSV logging.
+
 ## 0.6.0-mu - Source Calibration
 
 - Added a `Calibrate Source` GUI action for deriving instrumental delay and
